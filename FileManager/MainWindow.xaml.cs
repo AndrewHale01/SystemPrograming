@@ -3,7 +3,6 @@ using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.IO;
 using System.Runtime.CompilerServices;
-using System.Security.Cryptography;
 using System.Windows;
 
 namespace _08_FileManager
@@ -11,8 +10,10 @@ namespace _08_FileManager
     public partial class MainWindow : Window, INotifyPropertyChanged
     {
         private string _source = string.Empty;
+        private string _searchWord = string.Empty;
         private bool _isWaiting;
         private int _progress;
+        private string _progressText = "Готово до пошуку";
 
         public MainWindow()
         {
@@ -29,7 +30,18 @@ namespace _08_FileManager
             {
                 _source = value;
                 OnPropertyChanged();
-                OnPropertyChanged(nameof(CanAnalyze));
+                OnPropertyChanged(nameof(CanSearch));
+            }
+        }
+
+        public string SearchWord
+        {
+            get => _searchWord;
+            set
+            {
+                _searchWord = value;
+                OnPropertyChanged();
+                OnPropertyChanged(nameof(CanSearch));
             }
         }
 
@@ -40,7 +52,8 @@ namespace _08_FileManager
             {
                 _isWaiting = value;
                 OnPropertyChanged();
-                OnPropertyChanged(nameof(CanAnalyze));
+                OnPropertyChanged(nameof(CanSearch));
+                OnPropertyChanged(nameof(IsWaitingIndeterminate));
             }
         }
 
@@ -51,23 +64,36 @@ namespace _08_FileManager
             {
                 _progress = value;
                 OnPropertyChanged();
+                OnPropertyChanged(nameof(IsWaitingIndeterminate));
             }
         }
 
-        public bool CanAnalyze =>
+        public string ProgressText
+        {
+            get => _progressText;
+            set
+            {
+                _progressText = value;
+                OnPropertyChanged();
+            }
+        }
+
+        public bool CanSearch =>
             !IsWaiting &&
+            !string.IsNullOrWhiteSpace(SearchWord) &&
             !string.IsNullOrWhiteSpace(Source) &&
             Directory.Exists(Source);
 
-        public ObservableCollection<string> Summary { get; } = new();
-        public ObservableCollection<string> Extensions { get; } = new();
-        public ObservableCollection<string> Duplicates { get; } = new();
+        public bool IsWaitingIndeterminate =>
+            IsWaiting && Progress == 0;
+
+        public ObservableCollection<string> Report { get; } = new();
 
         private void Source_Button_Click(object sender, RoutedEventArgs e)
         {
             var dialog = new OpenFolderDialog
             {
-                Title = "Select folder to analyze"
+                Title = "Оберіть директорію для пошуку"
             };
 
             if (dialog.ShowDialog() == true)
@@ -76,149 +102,110 @@ namespace _08_FileManager
             }
         }
 
-        private async void Analyze_Button_Click(object sender, RoutedEventArgs e)
+        private async void Search_Button_Click(object sender, RoutedEventArgs e)
         {
-            if (!CanAnalyze)
+            if (!CanSearch)
             {
                 return;
             }
 
-            await AnalyzeAsync(Source);
+            await SearchAsync(Source, SearchWord);
         }
 
-        private async Task AnalyzeAsync(string rootPath)
+        private async Task SearchAsync(string rootPath, string word)
         {
             IsWaiting = true;
             Progress = 0;
-            Summary.Clear();
-            Extensions.Clear();
-            Duplicates.Clear();
+            ProgressText = "Пошук файлів...";
+            Report.Clear();
 
             try
             {
                 var files = await Task.Run(() => EnumerateFiles(rootPath));
                 if (files.Count == 0)
                 {
-                    Summary.Add("No files found.");
+                    ProgressText = "Файлів у директорії не знайдено.";
                     return;
                 }
 
-                long totalSize = 0;
-                var analyzedFiles = 0;
-                var extensionStats = new Dictionary<string, (int Count, long Size)>(
-                    StringComparer.OrdinalIgnoreCase);
-                var sizeGroups = new Dictionary<long, List<string>>();
+                var matches = 0;
 
                 for (int i = 0; i < files.Count; i++)
                 {
                     var file = files[i];
+                    ProgressText = $"Аналізовано {i + 1} з {files.Count}: {Path.GetFileName(file)}";
+
                     try
                     {
-                        var info = new FileInfo(file);
-                        if (!info.Exists)
+                        var text = await ReadTextAsync(file);
+                        var count = CountOccurrences(text, word);
+
+                        if (count > 0)
                         {
-                            continue;
+                            matches++;
+                            Report.Add(
+                                $"Назва файлу: {Path.GetFileName(file)}" +
+                                Environment.NewLine +
+                                $"Шлях до файлу: {file}" +
+                                Environment.NewLine +
+                                $"Кількість входження слова: {count}" +
+                                Environment.NewLine);
                         }
-
-                        totalSize += info.Length;
-                        analyzedFiles++;
-                        var extension = string.IsNullOrWhiteSpace(info.Extension)
-                            ? "(no extension)"
-                            : info.Extension.ToLowerInvariant();
-
-                        var extensionValue = extensionStats.TryGetValue(extension, out var value)
-                            ? value
-                            : (0, 0);
-                        extensionStats[extension] = (extensionValue.Count + 1, extensionValue.Size + info.Length);
-
-                        if (!sizeGroups.TryGetValue(info.Length, out var paths))
-                        {
-                            paths = new List<string>();
-                            sizeGroups[info.Length] = paths;
-                        }
-                        paths.Add(file);
                     }
                     catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                     {
-                        Summary.Add($"Skipped: {file}");
+                        Report.Add(
+                            $"Назва файлу: {Path.GetFileName(file)}" +
+                            Environment.NewLine +
+                            $"Шлях до файлу: {file}" +
+                            Environment.NewLine +
+                            "Кількість входження слова: файл неможливо прочитати" +
+                            Environment.NewLine);
                     }
 
                     Progress = (i + 1) * 100 / files.Count;
                     await Task.Yield();
                 }
 
-                var averageSize = analyzedFiles == 0 ? 0 : totalSize / analyzedFiles;
-                Summary.Add($"Files: {analyzedFiles:N0}");
-                Summary.Add($"Total size: {FormatSize(totalSize)}");
-                Summary.Add($"Average file size: {FormatSize(averageSize)}");
-
-                foreach (var item in extensionStats
-                             .OrderByDescending(x => x.Value.Count)
-                             .ThenBy(x => x.Key))
-                {
-                    Extensions.Add(
-                        $"{item.Key}: {item.Value.Count:N0} files, {FormatSize(item.Value.Size)}");
-                }
-
-                var duplicateGroups = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
-                var candidateIndex = 0;
-
-                foreach (var sizeGroup in sizeGroups.Where(x => x.Value.Count > 1))
-                {
-                    foreach (var path in sizeGroup.Value)
-                    {
-                        try
-                        {
-                            await using var stream = File.OpenRead(path);
-                            var hash = await SHA256.HashDataAsync(stream);
-                            var hashText = Convert.ToHexString(hash);
-
-                            if (!duplicateGroups.TryGetValue(hashText, out var paths))
-                            {
-                                paths = new List<string>();
-                                duplicateGroups[hashText] = paths;
-                            }
-                            paths.Add(path);
-                        }
-                        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-                        {
-                            Duplicates.Add($"Could not read: {path}");
-                        }
-
-                        candidateIndex++;
-                        Progress = candidateIndex * 100 /
-                                   Math.Max(1, sizeGroups.Where(x => x.Value.Count > 1).Sum(x => x.Value.Count));
-                        await Task.Yield();
-                    }
-                }
-
-                var foundDuplicates = duplicateGroups.Where(x => x.Value.Count > 1).ToList();
-                if (foundDuplicates.Count == 0)
-                {
-                    Duplicates.Add("No duplicate files found.");
-                }
-                else
-                {
-                    foreach (var group in foundDuplicates)
-                    {
-                        Duplicates.Add($"SHA-256: {group.Key}");
-                        foreach (var path in group.Value)
-                        {
-                            Duplicates.Add($"  {path}");
-                        }
-                    }
-                }
+                ProgressText = matches == 0
+                    ? $"Пошук завершено. Збіги не знайдено. Перевірено файлів: {files.Count}"
+                    : $"Пошук завершено. Знайдено у файлах: {matches}. Перевірено файлів: {files.Count}";
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
-                Summary.Clear();
-                Summary.Add($"Error: {ex.Message}");
+                ProgressText = $"Помилка пошуку: {ex.Message}";
             }
             finally
             {
                 Progress = 100;
                 IsWaiting = false;
             }
+        }
+
+        private static async Task<string> ReadTextAsync(string path)
+        {
+            await using var stream = File.Open(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var reader = new StreamReader(stream);
+            return await reader.ReadToEndAsync();
+        }
+
+        private static int CountOccurrences(string text, string word)
+        {
+            if (string.IsNullOrEmpty(text) || string.IsNullOrEmpty(word))
+            {
+                return 0;
+            }
+
+            var count = 0;
+            var index = 0;
+
+            while ((index = text.IndexOf(word, index, StringComparison.OrdinalIgnoreCase)) >= 0)
+            {
+                count++;
+                index += word.Length;
+            }
+
+            return count;
         }
 
         private static List<string> EnumerateFiles(string rootPath)
@@ -246,23 +233,6 @@ namespace _08_FileManager
             }
 
             return files;
-        }
-
-        private static string FormatSize(long bytes)
-        {
-            string[] units = { "B", "KB", "MB", "GB", "TB" };
-            double size = bytes;
-            var unit = 0;
-
-            while (size >= 1024 && unit < units.Length - 1)
-            {
-                size /= 1024;
-                unit++;
-            }
-
-            return unit == 0
-                ? $"{size:N0} {units[unit]}"
-                : $"{size:N2} {units[unit]}";
         }
 
         private void OnPropertyChanged([CallerMemberName] string? propertyName = null)
